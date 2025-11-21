@@ -1,4 +1,5 @@
 # Blender-v5-DAE-Importer-Add-on
+varyingopinions on Reddit
 A lightweight Blender 5 add-on that restores support for importing .dae (COLLADA) files after the official importer was removed in version 5.
 
 
@@ -13,3 +14,5 @@ Click Install… → select the .py file
 Enable Simple COLLADA (.dae)
 
 Import via File → Import → Simple COLLADA (.dae)
+
+

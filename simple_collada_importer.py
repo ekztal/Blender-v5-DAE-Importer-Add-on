@@ -1,21 +1,21 @@
 bl_info = {
     "name": "Simple COLLADA (.dae) Importer (Positions + Normals + Colors + UVs)",
     "author": "ekztal",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (5, 0, 0),
     "location": "File > Import > Simple COLLADA (.dae)",
     "description": "Imports COLLADA meshes with POSITION/NORMAL/COLOR/TEXCOORD inside <triangles> with multi-offset indexing.",
     "category": "Import-Export",
 }
 
-import bpy
+import os
 import math
+import bpy
 from bpy_extras.io_utils import ImportHelper
 from bpy.types import Operator
 from bpy.props import StringProperty
 from mathutils import Vector
 import xml.etree.ElementTree as ET
-import os
 
 
 # ---------------------- XML/NAMESPACE HELPERS ----------------------
@@ -36,7 +36,7 @@ def parse_source_float_array(source_elem, ns):
     """
     Parse <source><float_array>…</float_array></source>
     Handles stride from <accessor>.
-    Returns: list of tuples (length = stride)
+    Returns list of tuples (length = stride).
     """
     float_array = source_elem.find(q(ns, "float_array"))
     if float_array is None or float_array.text is None:
@@ -60,10 +60,56 @@ def parse_source_float_array(source_elem, ns):
     return out
 
 
+def extract_material_texture_map(root, ns):
+    """
+    Creates map: material_id -> texture_name (from first <init_from>).
+
+    Reads:
+      - <library_effects>
+      - <library_materials>
+    and connects material id -> effect id -> first init_from text.
+    """
+    texture_for_effect = {}
+    material_to_effect = {}
+
+    # ---- Read <library_effects> ----
+    effects = root.findall(f".//{q(ns,'effect')}")
+    for eff in effects:
+        eff_id = eff.attrib.get("id")
+        if not eff_id:
+            continue
+        # First <init_from> in this effect
+        init_from = eff.find(f".//{q(ns,'init_from')}")
+        if init_from is not None and init_from.text:
+            tex = init_from.text.strip()
+            texture_for_effect[eff_id] = tex
+
+    # ---- Read <library_materials> ----
+    materials = root.findall(f".//{q(ns,'material')}")
+    for mat in materials:
+        mat_id = mat.attrib.get("id")
+        if not mat_id:
+            continue
+        inst = mat.find(f"./{q(ns,'instance_effect')}")
+        if inst is not None:
+            eff_url = inst.attrib.get("url", "")
+            if eff_url.startswith("#"):
+                eff_url = eff_url[1:]
+            material_to_effect[mat_id] = eff_url
+
+    # ---- Build final map ----
+    mat_to_texture = {}
+    for mat_id, eff_id in material_to_effect.items():
+        if eff_id in texture_for_effect:
+            mat_to_texture[mat_id] = texture_for_effect[eff_id]
+
+    return mat_to_texture
+
+
 # ---------------------- GEOMETRY IMPORTER ----------------------
 
-def build_mesh_from_geometry(geom_elem, ns, collection):
-    """Convert <geometry> → Blender mesh with positions, normals, colors, UVs."""
+def build_mesh_from_geometry(geom_elem, ns, collection, material_texture_map):
+    """Convert <geometry> → Blender mesh with positions, normals, colors, UVs and materials."""
     mesh_elem = geom_elem.find(q(ns, "mesh"))
     if mesh_elem is None:
         print("Skipping geometry (no <mesh>):", geom_elem.attrib.get("id"))
@@ -75,12 +121,16 @@ def build_mesh_from_geometry(geom_elem, ns, collection):
     sources = {}
     for src in mesh_elem.findall(q(ns, "source")):
         src_id = src.attrib.get("id")
+        if not src_id:
+            continue
         sources[src_id] = parse_source_float_array(src, ns)
 
     # --- Parse <vertices> mapping ---
     vertices_map = {}
     for verts in mesh_elem.findall(q(ns, "vertices")):
         v_id = verts.attrib.get("id")
+        if not v_id:
+            continue
         for inp in verts.findall(q(ns, "input")):
             if inp.attrib.get("semantic") == "POSITION":
                 pos_id = inp.attrib.get("source", "")[1:]
@@ -88,10 +138,11 @@ def build_mesh_from_geometry(geom_elem, ns, collection):
 
     # --- Prepare accumulators ---
     positions = None
-    faces = []
-    corner_uvs = []
-    corner_cols = []
-    corner_norms = []
+    faces = []              # list[(v0, v1, v2)]
+    face_mat_ids = []       # list[str or None], same length as faces
+    corner_uvs = []         # list[(u, v)] per loop
+    corner_cols = []        # list[(r,g,b,a)] per loop
+    corner_norms = []       # list[Vector] per loop
 
     # --- Process <triangles> blocks ---
     for tri in mesh_elem.findall(q(ns, "triangles")):
@@ -100,6 +151,8 @@ def build_mesh_from_geometry(geom_elem, ns, collection):
         p_elem = tri.find(q(ns, "p"))
         if p_elem is None or not p_elem.text:
             continue
+
+        tri_mat_id = tri.attrib.get("material")  # e.g. "Material 2"
 
         # offset → (semantic, srcID, set)
         input_by_offset = {}
@@ -149,7 +202,7 @@ def build_mesh_from_geometry(geom_elem, ns, collection):
                 color_offset = off
                 color_source = sources.get(src)
             elif sem == "TEXCOORD":
-                # prefer TEXCOORD set="0"
+                # prefer TEXCOORD set="0" if multiple
                 if uv_source is None or set_idx == "0":
                     uv_offset = off
                     uv_source = sources.get(src)
@@ -210,6 +263,7 @@ def build_mesh_from_geometry(geom_elem, ns, collection):
                 continue
 
             faces.append(tuple(tri_vertices))
+            face_mat_ids.append(tri_mat_id)
             corner_norms.extend(tri_norm)
             corner_cols.extend(tri_col)
             corner_uvs.extend(tri_uv)
@@ -229,34 +283,68 @@ def build_mesh_from_geometry(geom_elem, ns, collection):
     # Create object
     obj = bpy.data.objects.new(geom_name, mesh)
     collection.objects.link(obj)
-    obj.rotation_euler[0] = math.pi / 2
 
-    # ---------------------- UVs ----------------------
-    if corner_uvs:
+    # Rotate Y-up → Z-up
+    obj.rotation_euler[0] = math.pi / 2.0
+
+# ---------------------- MATERIALS ----------------------
+    unique_mat_ids = sorted({m for m in face_mat_ids if m is not None})
+    mat_objects = {}
+    mat_index_map = {}
+
+    obj.data.materials.clear()
+
+    for idx, mat_id in enumerate(unique_mat_ids):
+
+        # Find texture name for this DAE material
+        texname = material_texture_map.get(mat_id)
+        if texname:
+            tex_base = texname.split('.')[0]
+        else:
+            tex_base = mat_id  # fallback
+
+        # Reuse existing material if it already exists
+        mat = bpy.data.materials.get(tex_base)
+        if mat is None:
+            mat = bpy.data.materials.new(tex_base)
+
+        obj.data.materials.append(mat)
+        mat_objects[mat_id] = mat
+        mat_index_map[mat_id] = idx
+
+
+    # Assign material index per polygon
+    for poly, mat_id in zip(mesh.polygons, face_mat_ids):
+        if mat_id is None:
+            continue
+        if mat_id in mat_index_map:
+            poly.material_index = mat_index_map[mat_id]
+
+# ---------------------- UVs ----------------------
+    if corner_uvs and len(corner_uvs) == len(mesh.loops):
         uv_layer = mesh.uv_layers.new(name="UVMap")
         for li, uv in enumerate(corner_uvs):
-            if li < len(uv_layer.data):
-                uv_layer.data[li].uv = uv
+            uv_layer.data[li].uv = uv
 
-    # ---------------------- COLORS ----------------------
-    if corner_cols:
+# ---------------------- COLORS ----------------------
+    if corner_cols and len(corner_cols) == len(mesh.loops):
         col_attr = mesh.color_attributes.new(
             name="Col",
             type="FLOAT_COLOR",
             domain="CORNER"
         )
         for li, col in enumerate(corner_cols):
-            if li < len(col_attr.data):
-                col_attr.data[li].color = col
+            col_attr.data[li].color = col
 
-    # ---------------------- NORMALS ----------------------
+# ---------------------- NORMALS ----------------------
     if corner_norms and len(corner_norms) == len(mesh.loops):
         mesh.normals_split_custom_set(corner_norms)
+        # Blender 5: no need for use_auto_smooth, split normals are used automatically
 
     return obj
 
 
-# ---------------------- OPERATOR ----------------------
+# ---------------------- IMPORT OPERATOR ----------------------
 
 class IMPORT_OT_simple_collada_full(Operator, ImportHelper):
     """Import a COLLADA (.dae) mesh with full features"""
@@ -268,6 +356,10 @@ class IMPORT_OT_simple_collada_full(Operator, ImportHelper):
 
     def execute(self, context):
 
+        if not os.path.isfile(self.filepath):
+            self.report({'ERROR'}, f"File not found: {self.filepath}")
+            return {'CANCELLED'}
+
         try:
             tree = ET.parse(self.filepath)
             root = tree.getroot()
@@ -276,6 +368,9 @@ class IMPORT_OT_simple_collada_full(Operator, ImportHelper):
             return {'CANCELLED'}
 
         ns = get_collada_ns(root)
+
+        # Build material -> texture mapping from DAE
+        material_texture_map = extract_material_texture_map(root, ns)
 
         # Use active collection
         if context.view_layer.active_layer_collection:
@@ -290,7 +385,7 @@ class IMPORT_OT_simple_collada_full(Operator, ImportHelper):
 
         imported = 0
         for geom in geometries:
-            obj = build_mesh_from_geometry(geom, ns, collection)
+            obj = build_mesh_from_geometry(geom, ns, collection, material_texture_map)
             if obj:
                 imported += 1
 
@@ -302,7 +397,88 @@ class IMPORT_OT_simple_collada_full(Operator, ImportHelper):
         return {'FINISHED'}
 
 
-# ---------------------- REGISTER ----------------------
+# ---------------------- TEXTURE ASSIGN OPERATOR ----------------------
+
+class OBJECT_OT_assign_textures_by_name(Operator):
+    """Assign textures based on material names matching image file names"""
+    bl_idname = "object.assign_textures_by_name"
+    bl_label = "Assign Textures by Name"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    directory: StringProperty(
+        name="Texture Folder",
+        description="Folder containing texture images",
+        subtype='DIR_PATH'
+    )
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        folder = bpy.path.abspath(self.directory)
+
+        if not os.path.isdir(folder):
+            self.report({'ERROR'}, f"Not a directory: {folder}")
+            return {'CANCELLED'}
+
+        exts = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".tif", ".tiff", ".dds"}
+        images = {}
+
+        # Load images from folder
+        for f in os.listdir(folder):
+            name, ext = os.path.splitext(f)
+            if ext.lower() in exts:
+                full = os.path.join(folder, f)
+                try:
+                    img = bpy.data.images.load(full, check_existing=True)
+                    images[name] = img
+                except:
+                    pass
+
+        assigned = 0
+
+        for obj in context.selected_objects:
+            if not hasattr(obj.data, "materials"):
+                continue
+
+            for mat in obj.data.materials:
+                if not mat:
+                    continue
+
+                key = str(mat.name).strip()  # <- CRUCIAL FIX
+
+                if key not in images:
+                    # print(f"No match for: {repr(key)}")
+                    continue
+
+                img = images[key]
+
+                mat.use_nodes = True
+                nodes = mat.node_tree.nodes
+                links = mat.node_tree.links
+
+                while nodes:
+                    nodes.remove(nodes[0])
+
+                out = nodes.new("ShaderNodeOutputMaterial")
+                out.location = (300, 0)
+                bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+                bsdf.location = (0, 0)
+                img_node = nodes.new("ShaderNodeTexImage")
+                img_node.image = img
+                img_node.location = (-300, 0)
+
+                links.new(img_node.outputs["Color"], bsdf.inputs["Base Color"])
+                links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+
+                assigned += 1
+
+        self.report({'INFO'}, f"Assigned textures to {assigned} materials.")
+        return {'FINISHED'}
+
+
+# ---------------------- MENUS & REGISTER ----------------------
 
 def menu_func_import(self, context):
     self.layout.operator(
@@ -311,15 +487,27 @@ def menu_func_import(self, context):
     )
 
 
+def menu_func_assign_textures(self, context):
+    self.layout.operator(
+        OBJECT_OT_assign_textures_by_name.bl_idname,
+        text="Assign Textures by Name"
+    )
+
+
 def register():
     bpy.utils.register_class(IMPORT_OT_simple_collada_full)
+    bpy.utils.register_class(OBJECT_OT_assign_textures_by_name)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
+    bpy.types.VIEW3D_MT_object.append(menu_func_assign_textures)
 
 
 def unregister():
+    bpy.types.VIEW3D_MT_object.remove(menu_func_assign_textures)
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+    bpy.utils.unregister_class(OBJECT_OT_assign_textures_by_name)
     bpy.utils.unregister_class(IMPORT_OT_simple_collada_full)
 
 
 if __name__ == "__main__":
     register()
+

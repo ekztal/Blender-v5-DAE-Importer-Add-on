@@ -7,7 +7,7 @@ A lightweight Blender 5 add-on that restores support for importing .dae (COLLADA
 
 Installation
 
-Download collada_import_full.py
+Download simple_collada_importer.py
 
 Blender → Edit → Preferences → Add-ons
 

@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "Simple COLLADA (.dae) Importer (Positions + Normals + Colors + UVs)",
+    "name": "Simple COLLADA (.dae) Importer (Positions + Normals + Colors + UVs + Textures)",
     "author": "ekztal",
-    "version": (0, 2, 0),
+    "version": (0, 3, 0),
     "blender": (5, 0, 0),
     "location": "File > Import > Simple COLLADA (.dae)",
-    "description": "Imports COLLADA meshes with POSITION/NORMAL/COLOR/TEXCOORD inside <triangles> with multi-offset indexing.",
+    "description": "Imports COLLADA meshes with POSITION/NORMAL/COLOR/TEXCOORD and auto-loads textures.",
     "category": "Import-Export",
 }
 
@@ -62,31 +62,89 @@ def parse_source_float_array(source_elem, ns):
 
 def extract_material_texture_map(root, ns):
     """
-    Creates map: material_id -> texture_name (from first <init_from>).
+    Creates map: material_id -> texture_file_path (resolved from library_images).
 
     Reads:
-      - <library_effects>
-      - <library_materials>
-    and connects material id -> effect id -> first init_from text.
+      - <library_images>   image_id  -> file path
+      - <library_effects>  effect_id -> image_id  (via sampler/surface chain or direct init_from)
+      - <library_materials> mat_id   -> effect_id
+    and connects material id -> effect -> sampler -> image -> file path.
     """
-    texture_for_effect = {}
-    material_to_effect = {}
 
-    # ---- Read <library_effects> ----
-    effects = root.findall(f".//{q(ns,'effect')}")
-    for eff in effects:
+    # ---- 1. Build image_id -> file path from <library_images> ----
+    image_path_for_id = {}
+    for img in root.findall(f".//{q(ns,'image')}"):
+        img_id = img.attrib.get("id")
+        if not img_id:
+            continue
+        init_from = img.find(q(ns, "init_from"))
+        if init_from is not None and init_from.text:
+            image_path_for_id[img_id] = init_from.text.strip()
+
+    # ---- 2. Build effect_id -> image file path ----
+    # Effects reference images via a sampler/surface chain:
+    #   <newparam sid="..."><surface><init_from>IMAGE_ID</init_from></surface></newparam>
+    #   <newparam sid="..."><sampler2D><source>SURFACE_SID</source></sampler2D></newparam>
+    #   <diffuse><texture texture="SAMPLER_SID" .../></diffuse>
+    # Or sometimes directly: <diffuse><texture texture="IMAGE_ID" .../>
+    # Or a bare <init_from> as fallback.
+
+    texture_for_effect = {}
+
+    for eff in root.findall(f".//{q(ns,'effect')}"):
         eff_id = eff.attrib.get("id")
         if not eff_id:
             continue
-        # First <init_from> in this effect
-        init_from = eff.find(f".//{q(ns,'init_from')}")
-        if init_from is not None and init_from.text:
-            tex = init_from.text.strip()
-            texture_for_effect[eff_id] = tex
 
-    # ---- Read <library_materials> ----
-    materials = root.findall(f".//{q(ns,'material')}")
-    for mat in materials:
+        # Build sid -> image_id map for surface params
+        sid_to_image = {}      # surface sid -> image_id
+        sid_to_surface = {}    # sampler sid -> surface sid
+
+        for newparam in eff.findall(f".//{q(ns,'newparam')}"):
+            sid = newparam.attrib.get("sid", "")
+            surface = newparam.find(q(ns, "surface"))
+            if surface is not None:
+                inf = surface.find(q(ns, "init_from"))
+                if inf is not None and inf.text:
+                    sid_to_image[sid] = inf.text.strip()
+            sampler = newparam.find(q(ns, "sampler2D"))
+            if sampler is not None:
+                src = sampler.find(q(ns, "source"))
+                if src is not None and src.text:
+                    sid_to_surface[sid] = src.text.strip()
+
+        # Try to find image via diffuse/texture reference
+        resolved = None
+        for tex_elem in eff.findall(f".//{q(ns,'texture')}"):
+            tex_ref = tex_elem.attrib.get("texture", "")
+            # tex_ref may be a sampler sid, surface sid, or direct image id
+            if tex_ref in sid_to_surface:
+                surface_sid = sid_to_surface[tex_ref]
+                image_id = sid_to_image.get(surface_sid, "")
+            elif tex_ref in sid_to_image:
+                image_id = sid_to_image[tex_ref]
+            else:
+                image_id = tex_ref  # treat as direct image id
+
+            file_path = image_path_for_id.get(image_id)
+            if file_path:
+                resolved = file_path
+                break
+
+        # Fallback: first <init_from> anywhere in the effect
+        if not resolved:
+            inf = eff.find(f".//{q(ns,'init_from')}")
+            if inf is not None and inf.text:
+                text = inf.text.strip()
+                # Could be an image id or a direct path
+                resolved = image_path_for_id.get(text, text)
+
+        if resolved:
+            texture_for_effect[eff_id] = resolved
+
+    # ---- 3. Build material_id -> effect_id ----
+    material_to_effect = {}
+    for mat in root.findall(f".//{q(ns,'material')}"):
         mat_id = mat.attrib.get("id")
         if not mat_id:
             continue
@@ -97,7 +155,7 @@ def extract_material_texture_map(root, ns):
                 eff_url = eff_url[1:]
             material_to_effect[mat_id] = eff_url
 
-    # ---- Build final map ----
+    # ---- 4. Build final map: mat_id -> texture file path ----
     mat_to_texture = {}
     for mat_id, eff_id in material_to_effect.items():
         if eff_id in texture_for_effect:
@@ -294,23 +352,84 @@ def build_mesh_from_geometry(geom_elem, ns, collection, material_texture_map):
 
     obj.data.materials.clear()
 
+    dae_dir = os.path.dirname(bpy.path.abspath(geom_elem.attrib.get("_dae_filepath", "")))
+
+    def _resolve_tex(raw_path):
+        """Return the first existing absolute path for a texture, or None."""
+        if not raw_path:
+            return None
+        for candidate in [
+            raw_path,
+            os.path.join(dae_dir, raw_path),
+            os.path.join(dae_dir, os.path.basename(raw_path)),
+        ]:
+            candidate = os.path.normpath(candidate)
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    def _mat_tex_path(m):
+        """Return the normalised filepath of the first TexImage node in m, or None."""
+        if not m.use_nodes:
+            return None
+        for n in m.node_tree.nodes:
+            if n.type == 'TEX_IMAGE' and n.image:
+                return os.path.normpath(bpy.path.abspath(n.image.filepath))
+        return None
+
+    def _build_mat_nodes(m, img):
+        """Clear node tree and build Image Texture -> Principled BSDF -> Output."""
+        m.use_nodes = True
+        nodes = m.node_tree.nodes
+        links = m.node_tree.links
+        nodes.clear()
+        out_node  = nodes.new("ShaderNodeOutputMaterial"); out_node.location  = ( 300, 0)
+        bsdf_node = nodes.new("ShaderNodeBsdfPrincipled"); bsdf_node.location = (   0, 0)
+        img_node  = nodes.new("ShaderNodeTexImage");       img_node.location  = (-300, 0)
+        img_node.image = img
+        links.new(img_node.outputs["Color"], bsdf_node.inputs["Base Color"])
+        links.new(bsdf_node.outputs["BSDF"], out_node.inputs["Surface"])
+
     for idx, mat_id in enumerate(unique_mat_ids):
 
-        # Find texture name for this DAE material
-        texname = material_texture_map.get(mat_id)
-        if texname:
-            tex_base = texname.split('.')[0]
-        else:
-            tex_base = mat_id  # fallback
+        # Resolve texture path for this material
+        raw_tex = material_texture_map.get(mat_id)
+        resolved_tex = _resolve_tex(raw_tex)
 
-        # Reuse existing material if it already exists
-        mat = bpy.data.materials.get(tex_base)
-        if mat is None:
-            mat = bpy.data.materials.new(tex_base)
+        # Derive a clean material name
+        tex_base = os.path.splitext(os.path.basename(resolved_tex))[0] if resolved_tex else mat_id
+
+        # Load the image (or reuse already-loaded one)
+        img = None
+        if resolved_tex:
+            try:
+                img = bpy.data.images.load(resolved_tex, check_existing=True)
+            except Exception as e:
+                print(f"Failed to load texture '{resolved_tex}': {e}")
+        elif raw_tex:
+            print(f"Texture file not found for material '{mat_id}': {raw_tex}")
+
+        # Decide whether to reuse an existing Blender material.
+        # Reuse ONLY if it already points to the exact same texture file.
+        # If the name matches but the texture differs (different skin), make a new material.
+        existing = bpy.data.materials.get(tex_base)
+        want_path = os.path.normpath(resolved_tex) if resolved_tex else None
+        if existing is not None and _mat_tex_path(existing) == want_path:
+            mat = existing  # truly the same texture -> safe to share
+        else:
+            mat = bpy.data.materials.new(tex_base)  # new or conflicting -> fresh material
+
+        # Build node setup only if freshly created (no TexImage node yet)
+        has_img_node = any(n.type == 'TEX_IMAGE' for n in mat.node_tree.nodes) if mat.use_nodes else False
+        if not has_img_node and img:
+            _build_mat_nodes(mat, img)
+            print(f"Texture loaded: '{resolved_tex}' -> material '{mat.name}'")
 
         obj.data.materials.append(mat)
         mat_objects[mat_id] = mat
         mat_index_map[mat_id] = idx
+
+
 
 
     # Assign material index per polygon
@@ -385,6 +504,8 @@ class IMPORT_OT_simple_collada_full(Operator, ImportHelper):
 
         imported = 0
         for geom in geometries:
+            # Attach filepath to geom so texture resolution can use it
+            geom.attrib["_dae_filepath"] = self.filepath
             obj = build_mesh_from_geometry(geom, ns, collection, material_texture_map)
             if obj:
                 imported += 1

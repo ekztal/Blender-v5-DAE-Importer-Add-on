@@ -16,7 +16,7 @@ Enable Simple COLLADA (.dae)
 Import via File → Import → Simple COLLADA (.dae)
 
 
-## What's New (v0.7.2):
+## What's New (v0.9.5):
 
 The original add-on imported geometry with basic material name assignment but no textures, no rig, and no skin weights. The following has been added:
 
@@ -33,6 +33,28 @@ The original add-on imported geometry with basic material name assignment but no
 + **Normal map compatibility** — Supports both FCOLLADA (Blender) and OpenCOLLADA3dsMax (3ds Max) exporter conventions for normal map channel detection.
 
 + **Bad diffuse correction** — If an exporter accidentally assigned an AO or specular map to the diffuse channel, the importer automatically substitutes the correct albedo file if one is found nearby.
+
++ **Bone name matching** — Some exporters prefix joint node IDs with a model name while the skin controller references bones by their short name only. The importer now resolves this mismatch automatically across multiple naming conventions.
+  
++ **Import options panel** — The file browser now includes a proper options panel: toggle UVs, normals, vertex colors, and materials independently.
+  
++ **Merge Vertices** — Optional post-import pass to remove duplicate vertices by distance, useful for models with split seams along UV borders.
+
++ **Universal joint name resolution** — Added a four-strategy lookup (exact ID, exact name, space-to-underscore normalisation, and suffix matching) so rigs from any exporter bind correctly without manual edits to the DAE file.
+  
++ **Unskinned mesh handling** — Meshes with no skin weights (rigid accessories, hair stubs with empty controllers) are now automatically parented to the armature object so they move with the rig.
+  
++ **Placeholder bone filtering**— Exporters that write NotABone placeholder entries in skin controllers no longer corrupt vertex group assignments. Placeholders are silently skipped while real bone weights are applied correctly.
+  
++ **Vertices-block normal/UV support** — Some exporters (notably Wii-era models) declare normals and UVs inside the <vertices> block rather than as separate primitive inputs. These are now read correctly, fixing flat shading on affected models.
+  
++ **Missing up-axis handling** — DAE files with no <up_axis> tag now default to Z-up instead of incorrectly applying a 90° rotation.
+
++ **Texture search improvement** — The importer now searches parent directories and subdirectories when textures aren't found directly next to the DAE, handling nested folder structures automatically.
+  
++ **Material rebuild fix** — Materials with no texture nodes are now always rebuilt rather than reused as grey placeholders.
+  
++ **Bad diffuse correction expanded** — Extended to catch more exporter-specific misassignments including specular and bump maps placed in the diffuse slot.
 
 
 ### Notes

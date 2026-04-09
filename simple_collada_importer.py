@@ -1,12 +1,11 @@
 bl_info = {
-    "name": "Simple COLLADA (.dae) Importer (Positions + Normals + Colors + UVs + Textures + Rig)",
-    "author": "ekztal"
-    "additional help": "MilesExilium"
-    "version": (0, 7, 2),
-    "blender": (5, 0, 0),
+    "name": "Simple COLLADA Importer",
+    "author": "ekztal, MilesExilium, RebeccaNod1",
+    "version": (1, 0),
+    "blender": (5, 1, 0),
     "location": "File > Import > Simple COLLADA (.dae)",
-    "description": "Imports COLLADA meshes with textures, armature, and skin weights.",
-    "category": "Import-Export",
+    "description": "Imports COLLADA (.dae) files",
+    "category": "Import-Export"
 }
 
 import os
@@ -571,7 +570,12 @@ def build_mesh_from_geometry(geom_elem, ns, collection, material_texture_map,
             continue
         for inp in verts.findall(q(ns, "input")):
             if inp.attrib.get("semantic") == "POSITION":
-                vertices_map[v_id] = inp.attrib.get("source", "")[1:]
+                src_val = inp.attrib.get("source", "")
+                # Robustly handle '#' prefix
+                if src_val.startswith("#"):
+                    vertices_map[v_id] = src_val[1:]
+                else:
+                    vertices_map[v_id] = src_val
 
     # --- Accumulators ---
     positions    = None
@@ -603,7 +607,9 @@ def build_mesh_from_geometry(geom_elem, ns, collection, material_texture_map,
         max_offset      = 0
         for inp in prim.findall(q(ns, "input")):
             sem   = inp.attrib.get("semantic")
-            src   = inp.attrib.get("source", "")[1:]
+            src_val = inp.attrib.get("source", "")
+            # Robustly handle '#' prefix
+            src = src_val[1:] if src_val.startswith("#") else src_val
             off   = int(inp.attrib.get("offset", "0"))
             set_i = inp.attrib.get("set")
             input_by_offset[off] = (sem, src, set_i)
@@ -611,16 +617,53 @@ def build_mesh_from_geometry(geom_elem, ns, collection, material_texture_map,
 
         num_inputs = max_offset + 1
 
-        vertex_offset = pos_source_id = None
+        vertex_offset = 0 # Default to 0 for SL
+        pos_source_id = None
         for off, (sem, src, _) in input_by_offset.items():
             if sem == "VERTEX":
                 vertex_offset = off
                 pos_source_id = vertices_map.get(src)
-                break
+                if pos_source_id: break
 
-        if vertex_offset is None or pos_source_id is None:
-            print("Missing POSITION source in:", geom_name)
-            return None
+        # --- FALLBACK: If VERTEX semantic failed, look for POSITION directly or by ID ---
+        if pos_source_id is None:
+            for off, (sem, src, _) in input_by_offset.items():
+                if sem == "POSITION":
+                    vertex_offset = off
+                    pos_source_id = src
+                    break
+        
+        # --- SECOND FALLBACK: Match by ID name (Common in SL exports) ---
+        if pos_source_id is None:
+            for src_id in sources.keys():
+                if "position" in src_id.lower():
+                    pos_source_id = src_id
+                    # Try to find which input uses this source to get the correct offset
+                    for off, (s_sem, s_src, _) in input_by_offset.items():
+                        if s_src == pos_source_id:
+                            vertex_offset = off
+                            break
+                    break
+
+        if pos_source_id is None:
+            print(f"DEBUG: Failed to find POSITION for {geom_name}")
+            print(f"DEBUG: vertices_map = {vertices_map}")
+            print(f"DEBUG: input_by_offset = {input_by_offset}")
+            
+            # Find any source that looks like positions as a last resort
+            for sid in sources.keys():
+                if "pos" in sid.lower():
+                   pos_source_id = sid
+                   print(f"DEBUG: Last resort matched: {pos_source_id}")
+                   # Try to find which input uses this source to get the correct offset
+                   for off, (s_sem, s_src, _) in input_by_offset.items():
+                       if s_src == pos_source_id:
+                           vertex_offset = off
+                           break
+                   break
+            
+            if pos_source_id is None:
+                return None
 
         positions = sources.get(pos_source_id)
         if not positions:
@@ -978,19 +1021,71 @@ class IMPORT_OT_simple_collada_full(Operator, ImportHelper):
             self.report({'ERROR'}, "No <geometry> found in DAE")
             return {'CANCELLED'}
 
+        # --- PROCESS VISUAL SCENE NODES ---
+        vs = root.find(f".//{q(ns,'visual_scene')}")
+        if vs is None:
+            self.report({'ERROR'}, "No <visual_scene> found in DAE")
+            return {'CANCELLED'}
+
         imported = 0
-        for geom in geometries:
-            geom_id      = geom.attrib.get("id", "")
-            mat_override = geom_mat_override.get(geom_id, {})
-            obj = build_mesh_from_geometry(
-                geom, ns, collection, material_texture_map,
-                arm_obj, controllers, mat_override, dae, armature_node_mat
-            )
-            if obj:
-                imported += 1
+        def parse_node_transform(node):
+            """Returns a 4x4 Matrix representing the local transform of this node."""
+            combined = Matrix.Identity(4)
+            # COLLADA nodes can have multiple transform tags in order.
+            for child in node:
+                tag = child.tag.replace(ns, "")
+                if tag == "matrix" and child.text:
+                    combined @= parse_matrix(child.text)
+                elif tag == "translate" and child.text:
+                    v = [float(x) for x in child.text.split()]
+                    combined @= Matrix.Translation(Vector(v))
+                elif tag == "rotate" and child.text:
+                    vals = [float(x) for x in child.text.split()]
+                    if len(vals) == 4:
+                        axis = Vector(vals[:3])
+                        angle = vals[3]
+                        combined @= Matrix.Rotation(math.radians(angle), 4, axis)
+                elif tag == "scale" and child.text:
+                    s = [float(x) for x in child.text.split()]
+                    combined @= Matrix.Diagonal(Vector((s[0], s[1], s[2], 1.0)))
+            return combined
+
+        # Geometry lookup map for fast access
+        geom_map = {g.attrib.get("id"): g for g in root.findall(f".//{q(ns,'geometry')}")}
+
+        def walk_scene(node, parent_mat, depth=0):
+            nonlocal imported
+            local_mat = parse_node_transform(node)
+            # Correction matrix (Z-up fix) only applies to prime root nodes if we want to rotate whole scene
+            # But usually we apply it to everything if the file is Y-UP.
+            # Blender is Z-UP, most DAE is Y-UP.
+            world_mat = parent_mat @ local_mat
+
+            # Look for geometry instances in this node
+            for ig in node.findall(q(ns, "instance_geometry")):
+                geom_url = ig.attrib.get("url", "")[1:]
+                if geom_url in geom_map:
+                    geom = geom_map[geom_url]
+                    mat_override = geom_mat_override.get(geom_url, {})
+                    obj = build_mesh_from_geometry(
+                        geom, ns, collection, material_texture_map,
+                        arm_obj, controllers, mat_override, dae, armature_node_mat
+                    )
+                    if obj:
+                        # Apply the world transform from the visual scene
+                        obj.matrix_world = world_mat
+                        imported += 1
+            
+            # Recursive walk for children
+            for child in node.findall(q(ns, "node")):
+                walk_scene(child, world_mat, depth + 1)
+
+        # Apply correction matrix at the root level so the whole cage stands upright
+        for node in vs.findall(q(ns, "node")):
+            walk_scene(node, correction_mat)
 
         if imported == 0:
-            self.report({'ERROR'}, "No objects created. Check console.")
+            self.report({'ERROR'}, "No objects created from visual scene. Check console.")
             return {'CANCELLED'}
 
         rig_msg = f" + armature ({arm_obj.name})" if arm_obj else ""
